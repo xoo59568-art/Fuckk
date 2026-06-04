@@ -1,7 +1,7 @@
 "use strict";
 
 // ─────────────────────────────────────────────────────
-//  Baileys Pair API
+//  Baileys Pair API  — 515 reconnect fixed
 //  GET /pp/pair?number=91XXXXXXXXXX&url=https://...
 // ─────────────────────────────────────────────────────
 
@@ -12,6 +12,7 @@ const {
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
   jidNormalizedUser,
+  DisconnectReason,
 } = require("@whiskeysockets/baileys");
 const { Jimp } = require("jimp");
 const pino  = require("pino");
@@ -27,12 +28,21 @@ const TEMP_DIR     = path.join(__dirname, "temp");
 
 [SESSIONS_DIR, TEMP_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
-// Active sessions: number → { sock, connected, finished }
+// number → session object
 const activeSessions = new Map();
 
 // ─────────────────────────────────────────────────────
-//  HELPER: download file from URL
+//  HELPERS
 // ─────────────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function cleanSession(number) {
+  try {
+    const d = path.join(SESSIONS_DIR, number);
+    if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
+  } catch (_) {}
+}
+
 function dlFile(url, dest) {
   return new Promise((res, rej) => {
     const proto = url.startsWith("https") ? https : http;
@@ -46,27 +56,10 @@ function dlFile(url, dest) {
   });
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function cleanSession(number) {
-  try {
-    const d = path.join(SESSIONS_DIR, number);
-    if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
-  } catch (_) {}
-}
-
 // ─────────────────────────────────────────────────────
-//  MAIN: create pairing socket & return code
+//  BUILD ONE SOCKET  (called per-attempt)
 // ─────────────────────────────────────────────────────
-async function createPairSession(number, imageUrl) {
-  // Kill any existing session for this number
-  const existing = activeSessions.get(number);
-  if (existing?.sock) {
-    try { existing.sock.end(); } catch (_) {}
-  }
-  activeSessions.delete(number);
-  cleanSession(number);
-
+async function buildSocket(number) {
   const dir = path.join(SESSIONS_DIR, number);
   fs.mkdirSync(dir, { recursive: true });
 
@@ -95,84 +88,159 @@ async function createPairSession(number, imageUrl) {
   });
 
   sock.ev.on("creds.update", saveCreds);
-
-  const session = {
-    sock,
-    connected : false,
-    finished  : false,
-    imageUrl,
-    number,
-  };
-  activeSessions.set(number, session);
-
-  // Wait for "connecting" then request pair code
-  const pairCode = await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timeout waiting for pair code")), 30_000);
-    let requested = false;
-
-    sock.ev.on("connection.update", async update => {
-      const { connection, lastDisconnect } = update;
-      const errCode = lastDisconnect?.error?.output?.statusCode;
-
-      if (connection === "connecting" && !requested) {
-        requested = true;
-        await sleep(3000);
-        try {
-          const raw  = await sock.requestPairingCode(number);
-          const code = raw.match(/.{1,4}/g).join("-");
-          clearTimeout(timeout);
-          resolve(code);
-        } catch (e) {
-          clearTimeout(timeout);
-          reject(e);
-        }
-      }
-
-      if (connection === "open") {
-        session.connected = true;
-        await saveCreds();
-        console.log(`[${number}] Connected! Running post-connect...`);
-        runPostConnect(session).catch(e => console.error(`[${number}] post-connect error:`, e.message));
-      }
-
-      if (connection === "close") {
-        if (session.connected || session.finished) return;
-        if (errCode === 515) {
-          // WA restart request — reconnect silently
-          console.log(`[${number}] 515 restart`);
-          return;
-        }
-        console.log(`[${number}] closed before open: ${errCode}`);
-        activeSessions.delete(number);
-        cleanSession(number);
-      }
-    });
-  });
-
-  return pairCode;
+  return { sock, saveCreds };
 }
 
 // ─────────────────────────────────────────────────────
-//  POST-CONNECT: set DP after device linked
+//  CREATE PAIR SESSION
+//  Returns pair code string, fires DP in background
 // ─────────────────────────────────────────────────────
-async function runPostConnect(session) {
-  const { sock, number, imageUrl } = session;
+async function createPairSession(number, imageUrl) {
+  // Kill any old session
+  const old = activeSessions.get(number);
+  if (old?.sock) { try { old.sock.end(); } catch (_) {} }
+  activeSessions.delete(number);
+  cleanSession(number);
+
+  // Shared state across sockets for this request
+  const shared = {
+    codeSent   : false,
+    connected  : false,
+    finished   : false,
+    imageUrl,
+    number,
+  };
+  activeSessions.set(number, shared);
+
+  // Promise resolves with pair code once we get it
+  return new Promise((resolve, reject) => {
+    const globalTimeout = setTimeout(() => {
+      if (!shared.connected) {
+        shared.finished = true;
+        activeSessions.delete(number);
+        cleanSession(number);
+        reject(new Error("Timeout: pair code nahi mila 30s me"));
+      }
+    }, 30_000);
+
+    // ── recursive socket spawner ────────────────────────
+    async function spawnSocket() {
+      if (shared.finished) return;
+
+      let saveCreds;
+      try {
+        const built = await buildSocket(number);
+        shared.sock = built.sock;
+        saveCreds   = built.saveCreds;
+      } catch (e) {
+        clearTimeout(globalTimeout);
+        shared.finished = true;
+        activeSessions.delete(number);
+        cleanSession(number);
+        return reject(e);
+      }
+
+      const sock = shared.sock;
+      let pairRequested = false;
+
+      sock.ev.on("creds.update", saveCreds);
+
+      sock.ev.on("connection.update", async update => {
+        const { connection, lastDisconnect } = update;
+        const errCode = lastDisconnect?.error?.output?.statusCode;
+
+        console.log(`[${number}] ${connection ?? "?"} | code: ${errCode ?? "-"}`);
+
+        // ── CONNECTING → request pair code ─────────────
+        if (connection === "connecting" && !pairRequested) {
+          pairRequested = true;
+          await sleep(3500);
+          if (shared.connected || shared.finished) return;
+
+          try {
+            const raw  = await sock.requestPairingCode(number);
+            const code = raw.match(/.{1,4}/g).join("-");
+            console.log(`[${number}] pair code: ${code}`);
+
+            if (!shared.codeSent) {
+              shared.codeSent = true;
+              clearTimeout(globalTimeout);
+              resolve(code);   // ← API response goes here
+            }
+          } catch (e) {
+            console.error(`[${number}] requestPairingCode error: ${e.message}`);
+            pairRequested = false; // allow retry on next connecting
+          }
+        }
+
+        // ── OPEN → run DP flow ──────────────────────────
+        if (connection === "open") {
+          if (shared.connected || shared.finished) return;
+          shared.connected = true;
+          clearTimeout(globalTimeout);
+          await saveCreds();
+          console.log(`[${number}] OPEN — starting DP flow`);
+          runPostConnect(shared, sock, saveCreds);
+        }
+
+        // ── CLOSE ───────────────────────────────────────
+        if (connection === "close") {
+          if (shared.finished) return;
+
+          // 515 = WA wants a fresh socket (normal after pair code request)
+          if (errCode === 515) {
+            console.log(`[${number}] 515 → spawning new socket`);
+            await sleep(1500);
+            spawnSocket();
+            return;
+          }
+
+          // Already connected — post-connect handles it
+          if (shared.connected) return;
+
+          // Auth errors — fatal
+          if (errCode === 401 || errCode === 403) {
+            shared.finished = true;
+            clearTimeout(globalTimeout);
+            activeSessions.delete(number);
+            cleanSession(number);
+            if (!shared.codeSent) reject(new Error(`WA auth error (${errCode}). Linked Devices check karo.`));
+            return;
+          }
+
+          // Other close before open — retry once
+          console.log(`[${number}] close ${errCode} → retry socket`);
+          await sleep(2000);
+          spawnSocket();
+        }
+      });
+    }
+
+    spawnSocket();
+  });
+}
+
+// ─────────────────────────────────────────────────────
+//  POST-CONNECT: set DP after linking
+// ─────────────────────────────────────────────────────
+async function runPostConnect(shared, sock, saveCreds) {
+  const { number, imageUrl } = shared;
   const self = jidNormalizedUser(sock.user.id);
 
-  console.log(`[${number}] Setting DP from: ${imageUrl}`);
+  await sleep(3000); // let WA settle after link
 
-  await sleep(3000); // let WA settle
+  const imgPath = path.join(TEMP_DIR, `${number}_dp.jpg`);
 
   // Download image
-  const imgPath = path.join(TEMP_DIR, `${number}_dp.jpg`);
   try {
     await dlFile(imageUrl, imgPath);
+    console.log(`[${number}] Image downloaded`);
   } catch (e) {
-    console.error(`[${number}] Image download failed:`, e.message);
-    return finish(session, imgPath);
+    console.error(`[${number}] Image download failed: ${e.message}`);
+    return finishSession(shared, sock, imgPath);
   }
 
-  // Set DP — Method 1: Jimp + raw IQ query
+  // ── DP Method 1: raw IQ query (fastest) ────────────
   let dpDone = false;
   try {
     const image = await Jimp.read(imgPath);
@@ -183,103 +251,88 @@ async function runPostConnect(session) {
       attrs : { to: "@s.whatsapp.net", type: "set", xmlns: "w:profile:picture" },
       content: [{ tag: "picture", attrs: { type: "image" }, content: buf }],
     });
-    console.log(`[${number}] DP set via Method 1`);
+    console.log(`[${number}] ✅ DP set (Method 1)`);
     dpDone = true;
   } catch (e) {
     console.log(`[${number}] Method 1 failed: ${e.message}`);
   }
 
-  // Method 2: updateProfilePicture
+  // ── DP Method 2: updateProfilePicture ──────────────
   if (!dpDone) {
     try {
       await sock.updateProfilePicture(self, fs.readFileSync(imgPath));
-      console.log(`[${number}] DP set via Method 2`);
+      console.log(`[${number}] ✅ DP set (Method 2)`);
       dpDone = true;
     } catch (e) {
       console.log(`[${number}] Method 2 failed: ${e.message}`);
     }
   }
 
-  if (!dpDone) {
-    console.error(`[${number}] DP set FAILED — both methods exhausted`);
-  }
+  if (!dpDone) console.error(`[${number}] ❌ DP set FAILED`);
 
   await sleep(2000);
-  finish(session, imgPath);
+  finishSession(shared, sock, imgPath);
 }
 
-function finish(session, imgPath) {
-  const { sock, number } = session;
-  session.finished = true;
+function finishSession(shared, sock, imgPath) {
+  shared.finished = true;
+  activeSessions.delete(shared.number);
   try { sock.logout(); } catch (_) { try { sock.end(); } catch (_) {} }
-  activeSessions.delete(number);
-  cleanSession(number);
+  cleanSession(shared.number);
   try { if (imgPath && fs.existsSync(imgPath)) fs.unlinkSync(imgPath); } catch (_) {}
-  console.log(`[${number}] Session cleaned.`);
+  console.log(`[${shared.number}] Done & cleaned.`);
 }
 
 // ─────────────────────────────────────────────────────
-//  ROUTE: GET /pp/pair?number=91XXX&url=https://...
+//  ROUTE
 // ─────────────────────────────────────────────────────
 app.get("/pp/pair", async (req, res) => {
   const { number, url } = req.query;
 
-  // ── Validation ──────────────────────────────────────
-  if (!number || !url) {
+  if (!number || !url)
     return res.status(400).json({
       success : false,
       error   : "number aur url dono required hain",
       example : "/pp/pair?number=917XXXXXXXXX&url=https://example.com/photo.jpg",
     });
-  }
 
   const phone = String(number).replace(/\D/g, "");
-  if (phone.length < 7 || phone.length > 15) {
-    return res.status(400).json({
-      success : false,
-      error   : "Invalid phone number",
-      example : "917288837763",
-    });
-  }
+  if (phone.length < 7 || phone.length > 15)
+    return res.status(400).json({ success: false, error: "Invalid phone number" });
 
-  let imageUrl = String(url);
-  if (!imageUrl.startsWith("http://") && !imageUrl.startsWith("https://")) {
+  const imageUrl = String(url);
+  if (!imageUrl.startsWith("http://") && !imageUrl.startsWith("https://"))
     return res.status(400).json({ success: false, error: "Invalid image URL" });
-  }
 
-  // ── Create session & get pair code ──────────────────
   try {
-    console.log(`[API] Pair request: +${phone} | url: ${imageUrl}`);
+    console.log(`[API] +${phone} | ${imageUrl}`);
     const code = await createPairSession(phone, imageUrl);
     return res.json({
-      success    : true,
-      number     : `+${phone}`,
-      pair_code  : code,
-      message    : "WA → Settings → Linked Devices → Link with phone number",
-      dp_status  : "DP will be set automatically after linking",
+      success   : true,
+      number    : `+${phone}`,
+      pair_code : code,
+      message   : "WA → Settings → Linked Devices → Link with phone number → code enter karo",
+      dp_note   : "DP auto set hoga linking ke baad",
     });
   } catch (e) {
-    console.error(`[API] Error for ${phone}:`, e.message);
+    console.error(`[API] Error +${phone}: ${e.message}`);
     return res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// ── Health check ──────────────────────────────────────
-app.get("/", (req, res) => {
-  res.json({
-    status   : "running",
-    endpoint : "/pp/pair?number=91XXXXXXXXXX&url=https://image-url.jpg",
-    sessions : activeSessions.size,
-  });
-});
+app.get("/", (_, res) => res.json({
+  status    : "✅ running",
+  endpoint  : "/pp/pair?number=91XXXXXXXXXX&url=https://image.jpg",
+  sessions  : activeSessions.size,
+}));
 
 // ─────────────────────────────────────────────────────
 //  START
 // ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 Pair API running on port ${PORT}`);
-  console.log(`📡 Endpoint: http://localhost:${PORT}/pp/pair?number=91XXX&url=https://...`);
+  console.log(`📡 http://localhost:${PORT}/pp/pair?number=91XXX&url=https://...\n`);
 });
 
-process.on("uncaughtException",  e => console.error("[uncaughtException]",  e?.message));
-process.on("unhandledRejection", e => console.error("[unhandledRejection]", e?.message));
+process.on("uncaughtException",  e => console.error("[uncaughtException]",  e?.message ?? e));
+process.on("unhandledRejection", e => console.error("[unhandledRejection]", e?.message ?? e));
